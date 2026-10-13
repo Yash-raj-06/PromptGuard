@@ -1,11 +1,13 @@
 {
     "model": "LogisticRegression",
+    "pipeline": "word+char-tfidf + LogisticRegression",
     "training_strategy": "synthetic_plus_real",
-    "vectorizer": "TF-IDF",
+    "vectorizer": "TF-IDF word(1,2)+char_wb(3,5)",
     "ngram_range": [
         1,
         2
     ],
+    "selection_method": "5-fold StratifiedKFold cross-validation (macro-F1) with the TF-IDF vectorizer inside the pipeline (fit per fold, no leakage); best pipeline refit on the full training set.",
     "total_samples": 846,
     "authored_samples": 300,
     "external_train_samples": 546,
@@ -14,35 +16,39 @@
     "authored_test_samples": 75,
     "safe_samples": 150,
     "malicious_samples": 150,
-    "feature_count": 9531,
+    "feature_count": 33704,
     "test_size": 0.25,
     "random_state": 42,
     "best_params": {
-        "C": 10.0
+        "clf__C": 10.0
     },
+    "class_order": [
+        0,
+        1
+    ],
     "evaluation_set": "Independent external test: deepset/prompt-injections (test split)",
-    "accuracy": 0.8621,
-    "precision": 0.9783,
-    "recall": 0.75,
-    "f1_score": 0.8491,
-    "macro_f1": 0.861,
-    "weighted_f1": 0.8606,
+    "accuracy": 0.8879,
+    "precision": 1.0,
+    "recall": 0.7833,
+    "f1_score": 0.8785,
+    "macro_f1": 0.8873,
+    "weighted_f1": 0.887,
     "per_class": {
         "Safe": {
-            "precision": 0.7857,
-            "recall": 0.9821,
-            "f1": 0.873
+            "precision": 0.8116,
+            "recall": 1.0,
+            "f1": 0.896
         },
         "Malicious": {
-            "precision": 0.9783,
-            "recall": 0.75,
-            "f1": 0.8491
+            "precision": 1.0,
+            "recall": 0.7833,
+            "f1": 0.8785
         }
     },
-    "false_positives": 1,
-    "false_negatives": 15,
-    "true_positives": 45,
-    "true_negatives": 55,
+    "false_positives": 0,
+    "false_negatives": 13,
+    "true_positives": 47,
+    "true_negatives": 56,
     "confusion_matrix": {
         "labels": [
             "Safe",
@@ -50,32 +56,32 @@
         ],
         "values": [
             [
-                55,
-                1
+                56,
+                0
             ],
             [
-                15,
-                45
+                13,
+                47
             ]
         ]
     },
     "authored_test": {
-        "accuracy": 0.88,
-        "precision": 0.8043,
-        "recall": 1.0,
-        "f1_score": 0.8916,
-        "macro_f1": 0.8786,
-        "weighted_f1": 0.8784,
+        "accuracy": 0.8533,
+        "precision": 0.7955,
+        "recall": 0.9459,
+        "f1_score": 0.8642,
+        "macro_f1": 0.8524,
+        "weighted_f1": 0.8522,
         "per_class": {
             "Safe": {
-                "precision": 1.0,
+                "precision": 0.9355,
                 "recall": 0.7632,
-                "f1": 0.8657
+                "f1": 0.8406
             },
             "Malicious": {
-                "precision": 0.8043,
-                "recall": 1.0,
-                "f1": 0.8916
+                "precision": 0.7955,
+                "recall": 0.9459,
+                "f1": 0.8642
             }
         },
         "confusion_matrix_values": [
@@ -84,14 +90,14 @@
                 9
             ],
             [
-                0,
-                37
+                2,
+                35
             ]
         ],
         "true_negatives": 29,
         "false_positives": 9,
-        "false_negatives": 0,
-        "true_positives": 37
+        "false_negatives": 2,
+        "true_positives": 35
     },
     "external_test": {
         "path": "dataset\\external_test.csv",
@@ -101,45 +107,45 @@
         "safe": 56,
         "malicious": 60,
         "status": "ok",
-        "accuracy": 0.8621,
-        "precision": 0.9783,
-        "recall": 0.75,
-        "f1_score": 0.8491,
-        "macro_f1": 0.861,
-        "weighted_f1": 0.8606,
+        "accuracy": 0.8879,
+        "precision": 1.0,
+        "recall": 0.7833,
+        "f1_score": 0.8785,
+        "macro_f1": 0.8873,
+        "weighted_f1": 0.887,
         "per_class": {
             "Safe": {
-                "precision": 0.7857,
-                "recall": 0.9821,
-                "f1": 0.873
+                "precision": 0.8116,
+                "recall": 1.0,
+                "f1": 0.896
             },
             "Malicious": {
-                "precision": 0.9783,
-                "recall": 0.75,
-                "f1": 0.8491
+                "precision": 1.0,
+                "recall": 0.7833,
+                "f1": 0.8785
             }
         },
         "confusion_matrix_values": [
             [
-                55,
-                1
+                56,
+                0
             ],
             [
-                15,
-                45
+                13,
+                47
             ]
         ],
-        "true_negatives": 55,
-        "false_positives": 1,
-        "false_negatives": 15,
-        "true_positives": 45
+        "true_negatives": 56,
+        "false_positives": 0,
+        "false_negatives": 13,
+        "true_positives": 47
     },
     "model_comparison": {
         "synthetic_only": {
-            "LogisticRegression": {
-                "cv_macro_f1": 0.9331,
+            "word-tfidf + LogisticRegression": {
+                "cv_macro_f1": 0.9287,
                 "best_params": {
-                    "C": 10.0
+                    "clf__C": 10.0
                 },
                 "auth_test": {
                     "accuracy": 0.8667,
@@ -150,10 +156,10 @@
                     "macro_f1": 0.696
                 }
             },
-            "MultinomialNB": {
+            "word-tfidf + MultinomialNB": {
                 "cv_macro_f1": 0.924,
                 "best_params": {
-                    "alpha": 0.1
+                    "clf__alpha": 0.1
                 },
                 "auth_test": {
                     "accuracy": 0.8533,
@@ -164,10 +170,10 @@
                     "macro_f1": 0.6113
                 }
             },
-            "LinearSVC+calibration": {
+            "word-tfidf + LinearSVC(calibrated)": {
                 "cv_macro_f1": 0.9331,
                 "best_params": {
-                    "estimator__C": 1.0
+                    "clf__estimator__C": 1.0
                 },
                 "auth_test": {
                     "accuracy": 0.8533,
@@ -177,13 +183,27 @@
                     "accuracy": 0.7069,
                     "macro_f1": 0.696
                 }
+            },
+            "word+char-tfidf + LogisticRegression": {
+                "cv_macro_f1": 0.9376,
+                "best_params": {
+                    "clf__C": 10.0
+                },
+                "auth_test": {
+                    "accuracy": 0.9067,
+                    "macro_f1": 0.9067
+                },
+                "external_test": {
+                    "accuracy": 0.6983,
+                    "macro_f1": 0.6836
+                }
             }
         },
         "synthetic_plus_real": {
-            "LogisticRegression": {
-                "cv_macro_f1": 0.9023,
+            "word-tfidf + LogisticRegression": {
+                "cv_macro_f1": 0.9088,
                 "best_params": {
-                    "C": 10.0
+                    "clf__C": 10.0
                 },
                 "auth_test": {
                     "accuracy": 0.88,
@@ -194,10 +214,10 @@
                     "macro_f1": 0.861
                 }
             },
-            "MultinomialNB": {
-                "cv_macro_f1": 0.8923,
+            "word-tfidf + MultinomialNB": {
+                "cv_macro_f1": 0.8972,
                 "best_params": {
-                    "alpha": 0.5
+                    "clf__alpha": 0.5
                 },
                 "auth_test": {
                     "accuracy": 0.8667,
@@ -208,10 +228,10 @@
                     "macro_f1": 0.8521
                 }
             },
-            "LinearSVC+calibration": {
-                "cv_macro_f1": 0.8996,
+            "word-tfidf + LinearSVC(calibrated)": {
+                "cv_macro_f1": 0.901,
                 "best_params": {
-                    "estimator__C": 1.0
+                    "clf__estimator__C": 1.0
                 },
                 "auth_test": {
                     "accuracy": 0.8667,
@@ -221,6 +241,20 @@
                     "accuracy": 0.8793,
                     "macro_f1": 0.8787
                 }
+            },
+            "word+char-tfidf + LogisticRegression": {
+                "cv_macro_f1": 0.9367,
+                "best_params": {
+                    "clf__C": 10.0
+                },
+                "auth_test": {
+                    "accuracy": 0.8533,
+                    "macro_f1": 0.8524
+                },
+                "external_test": {
+                    "accuracy": 0.8879,
+                    "macro_f1": 0.8873
+                }
             }
         }
     },
@@ -229,5 +263,5 @@
         "training": "Hand-authored synthetic examples + deepset/prompt-injections train split.",
         "external_test": "deepset/prompt-injections test split (held out, never trained on)."
     },
-    "limitations": "The authored training data is small and synthetic. The independent external test is a different distribution, so metrics reflect realistic generalization and are NOT production-grade. Adding more independently sourced data is required for production use."
+    "limitations": "Training mixes small hand-authored data with a public dataset. The independent external test is a different distribution, so metrics reflect realistic generalization and are NOT production-grade. 13 malicious external prompts are still missed; a semantic/embedding model and more data are required to improve recall."
 }

@@ -1,18 +1,22 @@
 """PromptGuard - model training and honest, leakage-safe evaluation.
 
 Produces the artifacts the FastAPI backend loads:
-    backend/model.pkl
-    backend/vectorizer.pkl
-    backend/model_info.json
+    backend/model.pkl        (fitted classifier operating on TF-IDF vectors)
+    backend/vectorizer.pkl   (fitted TF-IDF transformer)
+    backend/model_info.json  (metadata + evaluation results)
 
 Evaluation design (leakage-safe):
     * 0 = Safe, 1 = Malicious (contract expected by main.py).
     * The authored dataset is split into train/test BEFORE any fitting.
-    * TF-IDF is fit on the training split only.
-    * Algorithm selection uses cross-validation on training data only.
+    * Model selection uses 5-fold cross-validation on training data only,
+      with the whole feature+classifier PIPELINE inside GridSearchCV. This
+      means TF-IDF is fitted separately inside every CV fold, so validation
+      fold text never influences the vocabulary / IDF of that fold.
+    * After selection, the best pipeline is refit on the full permitted
+      training set (GridSearchCV refit=True).
     * dataset/external_test.csv (deepset/prompt-injections test split) is
       NEVER used for training or model selection. It is the independent,
-      held-out evaluation.
+      final evaluation only.
     * dataset/external_train.csv is real data added only for the
       "synthetic_plus_real" strategy.
 
@@ -26,6 +30,7 @@ import json
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 
 from sklearn.calibration import CalibratedClassifierCV
@@ -42,6 +47,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.naive_bayes import MultinomialNB
+from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.svm import LinearSVC
 
 # ==================================================
@@ -113,7 +119,7 @@ def load_authored():
     return data, stats
 
 
-def load_external(path, exclude_prompts, label):
+def load_external(path, exclude_prompts):
     info = {
         "path": str(path.relative_to(PROJECT_DIR)),
         "source": "deepset/prompt-injections (HuggingFace)",
@@ -145,8 +151,7 @@ def load_external(path, exclude_prompts, label):
 # 3. Evaluation helpers
 # ==================================================
 
-def evaluate(model, vectors, y_true):
-    predictions = model.predict(vectors)
+def compute_metrics(y_true, predictions):
     matrix = confusion_matrix(y_true, predictions, labels=[0, 1])
     tn, fp, fn, tp = matrix.ravel()
 
@@ -177,53 +182,85 @@ def evaluate(model, vectors, y_true):
     }
 
 
-def report_text(model, vectors, y_true):
+def report_text(y_true, predictions):
     return classification_report(
-        y_true, model.predict(vectors), labels=[0, 1],
+        y_true, predictions, labels=[0, 1],
         target_names=["Safe", "Malicious"], zero_division=0,
     )
 
 
-def build_vectorizer():
+# ==================================================
+# 4. Pipelines (TF-IDF + classifier) for leakage-safe CV
+# ==================================================
+# The whole pipeline is passed to GridSearchCV, so the TF-IDF step is fit on
+# the training part of every fold and applied to the validation part. This is
+# what prevents validation-fold text from leaking into the vocabulary/IDF.
+
+def word_tfidf():
     return TfidfVectorizer(
         lowercase=True, ngram_range=(1, 2), sublinear_tf=True,
         min_df=1, strip_accents="unicode",
     )
 
 
+def word_char_tfidf():
+    return FeatureUnion([
+        ("word", TfidfVectorizer(
+            lowercase=True, ngram_range=(1, 2), sublinear_tf=True,
+            min_df=1, strip_accents="unicode")),
+        ("char", TfidfVectorizer(
+            lowercase=True, analyzer="char_wb", ngram_range=(3, 5),
+            sublinear_tf=True, min_df=1, strip_accents="unicode")),
+    ])
+
+
 def build_candidates():
     return {
-        "LogisticRegression": (
-            LogisticRegression(max_iter=1000, class_weight="balanced",
-                               random_state=RANDOM_STATE),
-            {"C": [0.1, 1.0, 10.0]},
+        "word-tfidf + LogisticRegression": (
+            Pipeline([
+                ("features", word_tfidf()),
+                ("clf", LogisticRegression(
+                    max_iter=1000, class_weight="balanced",
+                    random_state=RANDOM_STATE)),
+            ]),
+            {"clf__C": [0.1, 1.0, 10.0]},
         ),
-        "MultinomialNB": (MultinomialNB(), {"alpha": [0.1, 0.5, 1.0]}),
-        "LinearSVC+calibration": (
-            CalibratedClassifierCV(LinearSVC(random_state=RANDOM_STATE), cv=3),
-            {"estimator__C": [0.1, 1.0]},
+        "word-tfidf + MultinomialNB": (
+            Pipeline([("features", word_tfidf()), ("clf", MultinomialNB())]),
+            {"clf__alpha": [0.1, 0.5, 1.0]},
+        ),
+        "word-tfidf + LinearSVC(calibrated)": (
+            Pipeline([
+                ("features", word_tfidf()),
+                ("clf", CalibratedClassifierCV(
+                    LinearSVC(random_state=RANDOM_STATE), cv=3)),
+            ]),
+            {"clf__estimator__C": [0.1, 1.0]},
+        ),
+        "word+char-tfidf + LogisticRegression": (
+            Pipeline([
+                ("features", word_char_tfidf()),
+                ("clf", LogisticRegression(
+                    max_iter=1000, class_weight="balanced",
+                    random_state=RANDOM_STATE)),
+            ]),
+            {"clf__C": [0.1, 1.0, 10.0]},
         ),
     }
 
 
 def run_strategy(train_texts, y_train, auth_test, ext_test):
-    """Fit vectorizer on this strategy's train only, then compare algorithms."""
-    vectorizer = build_vectorizer()
-    X_train = vectorizer.fit_transform(train_texts)
-    X_auth = vectorizer.transform(auth_test["prompt"])
-    X_ext = vectorizer.transform(ext_test["prompt"])
-
+    """Compare pipelines using training-only CV (TF-IDF fit inside each fold)."""
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     results = {}
-    for name, (estimator, grid) in build_candidates().items():
-        search = GridSearchCV(estimator, grid, scoring="f1_macro", cv=cv, n_jobs=1)
-        search.fit(X_train, y_train)
-        model = search.best_estimator_
-        auth_metrics = evaluate(model, X_auth, auth_test["labels"])
-        ext_metrics = evaluate(model, X_ext, ext_test["labels"])
+    for name, (pipeline, grid) in build_candidates().items():
+        search = GridSearchCV(pipeline, grid, scoring="f1_macro", cv=cv, n_jobs=1)
+        search.fit(train_texts, y_train)  # raw text -> pipeline vectorizes per fold
+        best = search.best_estimator_
+        auth_metrics = compute_metrics(auth_test["labels"], best.predict(auth_test["prompt"]))
+        ext_metrics = compute_metrics(ext_test["labels"], best.predict(ext_test["prompt"]))
         results[name] = {
-            "model": model,
-            "vectorizer": vectorizer,
+            "pipeline": best,
             "cv_macro_f1": round(float(search.best_score_), 4),
             "best_params": search.best_params_,
             "auth": auth_metrics,
@@ -233,13 +270,13 @@ def run_strategy(train_texts, y_train, auth_test, ext_test):
 
 
 # ==================================================
-# 4. Train, compare, select, evaluate
+# 5. Train, compare, select, evaluate
 # ==================================================
 
 def train_model():
-    print("\n" + "=" * 64)
-    print("                 PROMPTGUARD MODEL TRAINING")
-    print("=" * 64)
+    print("\n" + "=" * 66)
+    print("                   PROMPTGUARD MODEL TRAINING")
+    print("=" * 66)
 
     data, stats = load_authored()
     labels = data["label"].map(LABEL_TO_INT)
@@ -254,20 +291,21 @@ def train_model():
         data["prompt"], labels, test_size=TEST_SIZE,
         random_state=RANDOM_STATE, stratify=labels,
     )
-    auth_test = pd.DataFrame({"prompt": X_test, "labels": y_test})
+    auth_test = pd.DataFrame({"prompt": X_test.reset_index(drop=True),
+                              "labels": y_test.reset_index(drop=True)})
 
     print(f"Authored train: {len(X_train)}  authored test: {len(X_test)}  "
           f"(seed={RANDOM_STATE})")
 
     exclude = set(data["prompt"])
-    external_train, ext_train_info = load_external(EXTERNAL_TRAIN_PATH, exclude, "train")
+    external_train, ext_train_info = load_external(EXTERNAL_TRAIN_PATH, exclude)
     exclude = exclude | (set(external_train["prompt"]) if external_train is not None else set())
-    external_test, ext_test_info = load_external(EXTERNAL_TEST_PATH, exclude, "test")
+    external_test, ext_test_info = load_external(EXTERNAL_TEST_PATH, exclude)
 
     if external_test is None or len(external_test) == 0:
         raise RuntimeError("Independent external test set is required but unavailable.")
 
-    print(f"External TRAIN (real):  {ext_train_info.get('samples', 0)}")
+    print(f"External TRAIN (real):   {ext_train_info.get('samples', 0)}")
     print(f"External TEST (holdout): {ext_test_info['samples']} "
           f"(safe={ext_test_info.get('safe')}, malicious={ext_test_info.get('malicious')})")
 
@@ -290,17 +328,17 @@ def train_model():
     else:
         results["synthetic_plus_real"] = results["synthetic_only"]
 
-    # Dummy reference (strategy A data only).
-    dummy_vec = build_vectorizer()
-    dummy_X = dummy_vec.fit_transform(X_train)
-    dummy = DummyClassifier(strategy="most_frequent", random_state=RANDOM_STATE)
-    dummy.fit(dummy_X, y_train)
-    dummy_ext = evaluate(dummy, dummy_vec.transform(external_test["prompt"]),
-                         external_test["labels"])
+    # Dummy reference (strategy A data only), also via a pipeline.
+    dummy_pipe = Pipeline([
+        ("features", word_tfidf()),
+        ("clf", DummyClassifier(strategy="most_frequent", random_state=RANDOM_STATE)),
+    ])
+    dummy_pipe.fit(X_train, y_train)
+    dummy_ext = compute_metrics(external_test["labels"], dummy_pipe.predict(external_test["prompt"]))
 
-    # Print comparison table.
-    print("\nModel comparison (macro-F1):")
-    header = f"  {'strategy':<20}{'algorithm':<24}{'cv':>7}{'auth':>8}{'external':>10}"
+    # Comparison table.
+    print("\nModel comparison (macro-F1; CV uses pipeline so TF-IDF is per-fold):")
+    header = f"  {'strategy':<20}{'algorithm':<38}{'cv':>7}{'auth':>8}{'external':>10}"
     print(header)
     print("  " + "-" * (len(header) - 2))
     comparison = {}
@@ -315,41 +353,82 @@ def train_model():
                 "external_test": {"accuracy": res["ext"]["accuracy"],
                                   "macro_f1": res["ext"]["macro_f1"]},
             }
-            print(f"  {strategy:<20}{name:<24}{res['cv_macro_f1']:>7.4f}"
+            print(f"  {strategy:<20}{name:<38}{res['cv_macro_f1']:>7.4f}"
                   f"{res['auth']['macro_f1']:>8.4f}{res['ext']['macro_f1']:>10.4f}")
-    print(f"  {'synthetic_only':<20}{'Dummy (most_frequent)':<24}{'n/a':>7}"
+    print(f"  {'synthetic_only':<20}{'Dummy (most_frequent)':<38}{'n/a':>7}"
           f"{'n/a':>8}{dummy_ext['macro_f1']:>10.4f}")
 
     # Select production model: best CV macro-F1 within the production strategy.
     prod = results[PRODUCTION_STRATEGY]
     best_name = max(prod, key=lambda n: prod[n]["cv_macro_f1"])
-    model = prod[best_name]["model"]
-    vectorizer = prod[best_name]["vectorizer"]
+    pipeline = prod[best_name]["pipeline"]
     best_params = prod[best_name]["best_params"]
     internal_metrics = prod[best_name]["auth"]
     external_metrics = prod[best_name]["ext"]
 
-    print(f"\nProduction model: {PRODUCTION_STRATEGY} / {best_name} "
-          f"params={best_params}")
+    # Extract the two fitted steps so the backend contract is preserved.
+    vectorizer = pipeline.named_steps["features"]
+    model = pipeline.named_steps["clf"]
+
+    print(f"\nProduction model: {PRODUCTION_STRATEGY} / {best_name}")
+    print(f"Best params: {best_params}")
 
     print("\nAuthored held-out test report:")
-    print(report_text(model, vectorizer.transform(auth_test["prompt"]), auth_test["labels"]))
+    print(report_text(auth_test["labels"], pipeline.predict(auth_test["prompt"])))
     print("Independent external test report (deepset/prompt-injections):")
-    print(report_text(model, vectorizer.transform(external_test["prompt"]), external_test["labels"]))
+    print(report_text(external_test["labels"], pipeline.predict(external_test["prompt"])))
+
+    # Diagnostic only (NOT used for tuning): show missed attacks so weaknesses
+    # in the training distribution are visible.
+    ext_pred = pipeline.predict(external_test["prompt"])
+    missed = external_test[(external_test["labels"] == 1) & (ext_pred == 0)]
+    print(f"\nDiagnostic: {len(missed)} malicious external prompts missed (no tuning on these):")
+    for text in missed["prompt"].head(8):
+        print(f"  - {text[:90]}")
 
     # ==================================================
-    # 5. Save artifacts
+    # 6. Verify saved artifacts reproduce pipeline output
     # ==================================================
+
+    sample = list(auth_test["prompt"]) + list(external_test["prompt"])
+    pipeline_pred = pipeline.predict(sample)
+    separate_pred = model.predict(vectorizer.transform(sample))
+    same_predictions = bool(np.array_equal(pipeline_pred, separate_pred))
+    same_probabilities = bool(np.allclose(
+        pipeline.predict_proba(sample),
+        model.predict_proba(vectorizer.transform(sample)),
+        atol=1e-6,
+    ))
+    print(f"\nArtifact equivalence check: predictions match={same_predictions} "
+          f"probabilities match={same_probabilities}")
+    if not (same_predictions and same_probabilities):
+        raise RuntimeError("Saved vectorizer + model do not reproduce the pipeline.")
+    if list(model.classes_) != [0, 1]:
+        raise RuntimeError(f"Unexpected class order: {list(model.classes_)}")
 
     joblib.dump(model, MODEL_PATH)
     joblib.dump(vectorizer, VECTORIZER_PATH)
 
+    # ==================================================
+    # 7. Save metadata
+    # ==================================================
+
     headline = external_metrics
+    features_description = (
+        "TF-IDF word(1,2)+char_wb(3,5)" if isinstance(vectorizer, FeatureUnion)
+        else "TF-IDF word(1,2)"
+    )
     model_info = {
-        "model": best_name,
+        "model": best_name.split(" + ")[-1],
+        "pipeline": best_name,
         "training_strategy": PRODUCTION_STRATEGY,
-        "vectorizer": "TF-IDF",
+        "vectorizer": features_description,
         "ngram_range": [1, 2],
+        "selection_method": (
+            "5-fold StratifiedKFold cross-validation (macro-F1) with the "
+            "TF-IDF vectorizer inside the pipeline (fit per fold, no leakage); "
+            "best pipeline refit on the full training set."
+        ),
         "total_samples": int(len(data) + ext_train_info.get("samples", 0)),
         "authored_samples": int(len(data)),
         "external_train_samples": int(ext_train_info.get("samples", 0)),
@@ -362,6 +441,7 @@ def train_model():
         "test_size": TEST_SIZE,
         "random_state": RANDOM_STATE,
         "best_params": best_params,
+        "class_order": [int(c) for c in model.classes_],
         "evaluation_set": "Independent external test: deepset/prompt-injections (test split)",
         "accuracy": headline["accuracy"],
         "precision": headline["precision"],
@@ -387,10 +467,12 @@ def train_model():
             "external_test": "deepset/prompt-injections test split (held out, never trained on).",
         },
         "limitations": (
-            "The authored training data is small and synthetic. The independent "
-            "external test is a different distribution, so metrics reflect "
-            "realistic generalization and are NOT production-grade. Adding more "
-            "independently sourced data is required for production use."
+            "Training mixes small hand-authored data with a public dataset. The "
+            "independent external test is a different distribution, so metrics "
+            "reflect realistic generalization and are NOT production-grade. "
+            f"{headline['false_negatives']} malicious external prompts are still "
+            "missed; a semantic/embedding model and more data are required to "
+            "improve recall."
         ),
     }
 
@@ -398,13 +480,13 @@ def train_model():
         json.dump(model_info, file, indent=4)
 
     # ==================================================
-    # 6. Report
+    # 8. Report
     # ==================================================
 
-    print("\n" + "=" * 64)
+    print("\n" + "=" * 66)
     print("                     TRAINING COMPLETE")
-    print("=" * 64)
-    print(f"Saved model: {PRODUCTION_STRATEGY} / {best_name}")
+    print("=" * 66)
+    print(f"Saved model: {best_name} ({PRODUCTION_STRATEGY})")
     print("Headline = independent external test (deepset/prompt-injections):")
     print(f"  Accuracy:    {headline['accuracy']:.4f}")
     print(f"  Macro-F1:    {headline['macro_f1']:.4f}")
@@ -417,7 +499,7 @@ def train_model():
     print(f"\nModel:      {MODEL_PATH}")
     print(f"Vectorizer: {VECTORIZER_PATH}")
     print(f"Model info: {MODEL_INFO_PATH}")
-    print("=" * 64)
+    print("=" * 66)
 
 
 if __name__ == "__main__":

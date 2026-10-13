@@ -21,6 +21,10 @@ BASE_DIR = Path(__file__).resolve().parent
 
 MAX_PROMPT_LENGTH = 5000
 
+# LIME perturbs the input this many times. The default (5000) is very slow
+# with word+char TF-IDF features, so we use a smaller, still-meaningful number.
+LIME_SAMPLES = 500
+
 app = FastAPI(
     title="PromptGuard API",
     description="Prompt Injection Detection with Explainable AI",
@@ -39,6 +43,9 @@ app.add_middleware(
         "http://localhost:4173",
         "http://127.0.0.1:4173",
     ],
+    # Also accept any localhost/127.0.0.1 port so the dev server still works
+    # if 5173 is taken and Vite falls back to another port.
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -152,6 +159,26 @@ def predict_proba(texts):
     return probabilities[:, [SAFE_INDEX, MALICIOUS_INDEX]]
 
 
+def warmup_explainer():
+    """Pay LIME's one-time start-up cost so the first user request is fast."""
+    if model is None or vectorizer is None:
+        return
+    try:
+        explainer.explain_instance(
+            "warmup text",
+            predict_proba,
+            labels=(0, 1),
+            num_features=2,
+            num_samples=50,
+        )
+        logger.info("LIME explainer warmed up.")
+    except Exception:  # noqa: BLE001
+        logger.exception("LIME warmup failed")
+
+
+app.add_event_handler("startup", warmup_explainer)
+
+
 # ==============================
 # HOME
 # ==============================
@@ -234,6 +261,7 @@ def predict(request: PromptRequest):
                 predict_proba,
                 labels=(0, 1),
                 num_features=5,
+                num_samples=LIME_SAMPLES,
             )
             selected_label = 1 if prediction_value == 1 else 0
             for word, weight in explanation.as_list(label=selected_label):
