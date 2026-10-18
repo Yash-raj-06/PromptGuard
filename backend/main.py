@@ -10,6 +10,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from lime.lime_text import LimeTextExplainer
 
+from attack_types import classify_attack_type
+from policy import recommend_action
+from robustness import evaluate_robustness
+
 # ==============================
 # PROMPTGUARD API
 # ==============================
@@ -133,6 +137,11 @@ class PromptRequest(BaseModel):
     prompt: str
 
 
+class RobustnessRequest(BaseModel):
+    prompt: str
+    include_paraphrase: bool = True
+
+
 # ==============================
 # VALIDATION ERROR HANDLER
 # ==============================
@@ -213,78 +222,162 @@ def get_model_info():
 
 
 # ==============================
-# PROMPT PREDICTION
+# SHARED HELPERS
 # ==============================
 
-@app.post("/predict")
-def predict(request: PromptRequest):
-    if model is None or vectorizer is None:
-        raise HTTPException(status_code=503, detail=MODEL_LOAD_ERROR)
-
-    prompt = request.prompt.strip()
-
+def _validate_prompt(raw: str) -> str:
+    prompt = raw.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Please enter a prompt.")
-
     if len(prompt) > MAX_PROMPT_LENGTH:
         raise HTTPException(
             status_code=400,
             detail=f"Prompt is too long. Maximum length is {MAX_PROMPT_LENGTH} characters.",
         )
+    return prompt
 
+
+def _predict_core(prompt: str) -> dict:
+    """Binary prediction only (no LIME). Raises 503 if artifacts are missing."""
+    if model is None or vectorizer is None:
+        raise HTTPException(status_code=503, detail=MODEL_LOAD_ERROR)
+
+    prompt_vector = vectorizer.transform([prompt])
+    prediction_value = int(model.predict(prompt_vector)[0])
+    probabilities = model.predict_proba(prompt_vector)[0]
+
+    safe_probability = float(probabilities[SAFE_INDEX])
+    malicious_probability = float(probabilities[MALICIOUS_INDEX])
+
+    # Guard against NaN/inf and keep the percent contract (sum ~= 100).
+    if not (safe_probability == safe_probability):  # NaN check
+        safe_probability = 0.0
+    if not (malicious_probability == malicious_probability):
+        malicious_probability = 0.0
+    total = safe_probability + malicious_probability
+    if total <= 0:
+        safe_probability, malicious_probability = 0.5, 0.5
+    else:
+        safe_probability /= total
+        malicious_probability /= total
+
+    return {
+        "prediction_value": prediction_value,
+        "prediction": "Malicious" if prediction_value == 1 else "Safe",
+        "safe_probability": round(safe_probability * 100, 2),
+        "malicious_probability": round(malicious_probability * 100, 2),
+        "malicious_fraction": malicious_probability,
+    }
+
+
+def _explain(prompt: str, prediction_value: int) -> list:
+    """LIME token contributions for the predicted class (never raises)."""
+    explanation_data = []
+    if model is None or vectorizer is None:
+        return explanation_data
     try:
-        prompt_vector = vectorizer.transform([prompt])
-        prediction_value = int(model.predict(prompt_vector)[0])
-        probabilities = model.predict_proba(prompt_vector)[0]
-
-        safe_probability = float(probabilities[SAFE_INDEX])
-        malicious_probability = float(probabilities[MALICIOUS_INDEX])
-
-        # Guard against NaN/inf and keep the API contract (percent, sum ~= 100).
-        if not (safe_probability == safe_probability):  # NaN check
-            safe_probability = 0.0
-        if not (malicious_probability == malicious_probability):
-            malicious_probability = 0.0
-        total = safe_probability + malicious_probability
-        if total <= 0:
-            safe_probability, malicious_probability = 0.5, 0.5
-        else:
-            safe_probability /= total
-            malicious_probability /= total
-
-        prediction = "Malicious" if prediction_value == 1 else "Safe"
-
-        explanation_data = []
-        try:
-            explanation = explainer.explain_instance(
-                prompt,
-                predict_proba,
-                labels=(0, 1),
-                num_features=5,
-                num_samples=LIME_SAMPLES,
+        explanation = explainer.explain_instance(
+            prompt,
+            predict_proba,
+            labels=(0, 1),
+            num_features=5,
+            num_samples=LIME_SAMPLES,
+        )
+        selected_label = 1 if prediction_value == 1 else 0
+        for word, weight in explanation.as_list(label=selected_label):
+            explanation_data.append(
+                {"word": str(word), "weight": round(float(weight), 4)}
             )
-            selected_label = 1 if prediction_value == 1 else 0
-            for word, weight in explanation.as_list(label=selected_label):
-                explanation_data.append(
-                    {"word": str(word), "weight": round(float(weight), 4)}
-                )
-        except Exception:  # noqa: BLE001 - explanation must never break prediction
-            logger.exception("LIME explanation failed")
+    except Exception:  # noqa: BLE001 - explanation must never break prediction
+        logger.exception("LIME explanation failed")
+    return explanation_data
 
+
+# ==============================
+# PROMPT PREDICTION (unchanged public contract)
+# ==============================
+
+@app.post("/predict")
+def predict(request: PromptRequest):
+    prompt = _validate_prompt(request.prompt)
+    try:
+        core = _predict_core(prompt)
+        explanation_data = _explain(prompt, core["prediction_value"])
         return {
             "prompt": prompt,
-            "prediction": prediction,
-            "safe_probability": round(safe_probability * 100, 2),
-            "malicious_probability": round(malicious_probability * 100, 2),
+            "prediction": core["prediction"],
+            "safe_probability": core["safe_probability"],
+            "malicious_probability": core["malicious_probability"],
             "explanation": explanation_data,
         }
-
     except HTTPException:
         raise
-
     except Exception as error:  # noqa: BLE001
         logger.exception("Prediction failed")
         raise HTTPException(
             status_code=500,
             detail="Prediction failed. Please try again later.",
+        ) from error
+
+
+# ==============================
+# FULL ANALYSIS (prediction + attack type + recommendation)
+# ==============================
+
+@app.post("/analyze")
+def analyze(request: PromptRequest):
+    prompt = _validate_prompt(request.prompt)
+    try:
+        core = _predict_core(prompt)
+        explanation_data = _explain(prompt, core["prediction_value"])
+        attack_type = classify_attack_type(prompt, core["prediction"])
+        recommendation = recommend_action(core["malicious_fraction"])
+        return {
+            "prompt": prompt,
+            "prediction": core["prediction"],
+            "safe_probability": core["safe_probability"],
+            "malicious_probability": core["malicious_probability"],
+            "explanation": explanation_data,
+            "attack_type": attack_type,
+            "recommendation": recommendation,
+        }
+    except HTTPException:
+        raise
+    except Exception as error:  # noqa: BLE001
+        logger.exception("Analysis failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Analysis failed. Please try again later.",
+        ) from error
+
+
+# ==============================
+# ROBUSTNESS TESTING (separate from normal prediction)
+# ==============================
+
+@app.post("/robustness")
+def robustness(request: RobustnessRequest):
+    prompt = _validate_prompt(request.prompt)
+    try:
+        def _robust_predict(text: str) -> dict:
+            core = _predict_core(text)
+            return {
+                "prediction": core["prediction"],
+                "safe_probability": core["safe_probability"],
+                "malicious_probability": core["malicious_probability"],
+            }
+
+        result = evaluate_robustness(
+            prompt,
+            _robust_predict,
+            include_paraphrase=bool(request.include_paraphrase),
+        )
+        return {"prompt": prompt, **result}
+    except HTTPException:
+        raise
+    except Exception as error:  # noqa: BLE001
+        logger.exception("Robustness test failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Robustness test failed. Please try again later.",
         ) from error

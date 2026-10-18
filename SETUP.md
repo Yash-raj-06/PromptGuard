@@ -4,7 +4,10 @@ Explainable Prompt Injection Detection System.
 
 - Backend: Python 3.12 + FastAPI
 - ML: scikit-learn (TF-IDF word + char n-grams + Logistic Regression), selected with pipeline cross-validation
-- Explainable AI: LIME
+- Explainable AI: LIME (explains the classifier; it is not the classifier)
+- Attack types: transparent rule-based heuristic (not a learned multi-class model)
+- Robustness: controlled transformations + consistency score
+- Defensive policy: Allow / Flag for Review / Block (configurable thresholds)
 - Frontend: React 19 + Vite 8 (3D glass UI, lucide-react icons)
 
 ---
@@ -121,8 +124,11 @@ From `backend`:
 
 ```powershell
 cd backend
-python -m pytest test_api.py -v
+python -m pytest -v
 ```
+
+This runs all backend tests: `test_api.py` (core API/ML) and `test_features.py`
+(attack types, robustness, policy, new endpoints).
 
 ### Frontend (lint + tests + build)
 
@@ -155,15 +161,68 @@ Get-NetTCPConnection -LocalPort 8000 | ForEach-Object { Stop-Process -Id $_.Owni
 | --- | --- |
 | `ModuleNotFoundError: No module named 'lime'` | `python -m pip install -r requirements.txt` from `backend`. |
 | `ModuleNotFoundError: pandas._libs.pandas_parser` | Broken pandas install: `python -m pip install --force-reinstall --no-cache-dir pandas==2.3.3`. |
-| Header shows "API Offline" | Start the backend (Terminal 1) and refresh. |
-| `503` on `/predict` | Model artifacts missing. Run `python train_model.py`. |
+| Model metrics show "offline" | Start the backend (Terminal 1) and refresh. |
+| `503` on `/predict`, `/analyze` or `/robustness` | Model artifacts missing. Run `python train_model.py`. |
 | Frontend cannot reach backend / CORS error | Keep the backend on port 8000 and open the site at http://localhost:5173 (not a `file://` path). |
 | `npm` native binding error (`rolldown` / `lightningcss`) | `Remove-Item -Recurse -Force node_modules` then `npm ci`. |
 | Port already in use | Stop the other process or change `--port`. |
 
 ---
 
-## 8. Model evaluation results
+## 8. Attack type, robustness and recommendation
+
+These features are separate from the binary Safe/Malicious prediction.
+
+### Attack type (`backend/attack_types.py`)
+A transparent **rule-based heuristic** with five categories plus
+`Unknown / Uncertain`: instruction override, jailbreak/role-play,
+system-prompt extraction, indirect injection, and obfuscation. Only prompts
+classified `Malicious` are categorised; `Safe` prompts return
+`Unknown / Uncertain` with `applicable: false`, so harmless discussion or
+quotation of an attack is not mislabelled. The response includes
+`method: "rule_based_heuristic"` and `is_learned: false`. There is no
+multi-class labelled dataset in this project, so this is intentionally **not**
+a trained multi-class classifier.
+
+### Robustness (`backend/robustness.py`, `POST /robustness`)
+Applies nine documented local transformations (uppercase, extra whitespace,
+punctuation spacing/removal, leetspeak substitution, spaced letters, hyphenated
+letters, last-two-letter typo, limited synonym paraphrase) and compares each
+prediction with the original. The summary reports:
+
+```
+consistency_score = 100 * unchanged_predictions / evaluated transformations
+```
+
+Transformation or prediction failures are reported per row and never break the
+request. A high score does **not** prove resistance to real attacks.
+
+### Defensive recommendation (`backend/policy.py`, in `POST /analyze`)
+Maps the actual malicious probability to:
+- `Block` if `>= 0.85`
+- `Flag for Review` if `>= 0.40` (includes the borderline 0.40-0.60 range)
+- `Allow` otherwise
+
+Thresholds are configurable before starting the backend:
+
+```powershell
+$env:PROMPTGUARD_BLOCK_THRESHOLD = "0.90"
+$env:PROMPTGUARD_REVIEW_THRESHOLD = "0.50"
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+Recommendations are decision support only; a high probability is not proof of
+malicious intent, and no enforcement integration is attached.
+
+### New API endpoints
+- `POST /analyze` - prediction + LIME + attack type + recommendation
+- `POST /robustness` - `{"prompt": "...", "include_paraphrase": true}`
+
+`/predict`, `/health` and `/model-info` keep their existing contracts.
+
+---
+
+## 9. Model evaluation results
 
 Model selection uses **5-fold stratified cross-validation with the whole
 pipeline** (TF-IDF is fit inside every fold), scoring macro-F1 on training data
@@ -192,7 +251,7 @@ Known weaknesses (honest):
 
 ---
 
-## 9. Notes and limitations
+## 10. Notes and limitations
 
 - Training data mixes small **hand-authored synthetic** prompts
   (`dataset/prompts.csv`) with the real `deepset/prompt-injections` train split.
@@ -200,5 +259,11 @@ Known weaknesses (honest):
   (`dataset/external_test.csv`), which the model never trained on. They reflect
   realistic generalization and are **not** production-grade.
 - The model uses TF-IDF bag-of-words features; it does not understand meaning.
+- Attack categories are a **rule-based heuristic**, not a trained multi-class
+  model, and are evidence estimates only.
+- Robustness results cover a small deterministic set of transformations and do
+  not prove resistance to arbitrary attacks.
+- `Allow / Flag for Review / Block` are decision-support recommendations, not
+  enforcement guarantees.
 - LIME explanations show which words influenced a prediction. They are **not**
-  proof of intent or causation.
+  proof of intent or causation, and LIME is not the classifier.

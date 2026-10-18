@@ -23,6 +23,7 @@ import Background3D from "./components/Background3D";
 import TiltCard from "./components/TiltCard";
 import Gauge3D from "./components/Gauge3D";
 import ConfusionMatrix3D from "./components/ConfusionMatrix3D";
+import SecurityIntelligence from "./components/SecurityIntelligence";
 import "./App.css";
 
 const API_BASE =
@@ -53,8 +54,9 @@ function App() {
   const [modelInfo, setModelInfo] = useState(null);
   const [modelInfoError, setModelInfoError] = useState(false);
   const [copiedPrompt, setCopiedPrompt] = useState(false);
-  // "checking" | "online" | "offline"
-  const [apiStatus, setApiStatus] = useState("checking");
+  const [robustness, setRobustness] = useState(null);
+  const [robustnessLoading, setRobustnessLoading] = useState(false);
+  const [robustnessError, setRobustnessError] = useState(null);
 
   const examples = [
     {
@@ -99,22 +101,9 @@ function App() {
       });
   };
 
-  // On mount: check backend health and load model performance metadata.
+  // On mount: load model performance metadata.
   useEffect(() => {
     let active = true;
-
-    const loadHealth = async () => {
-      try {
-        const response = await fetch(`${API_BASE}/health`);
-        const data = await response.json().catch(() => null);
-        if (!active) return;
-        setApiStatus(
-          response.ok && data?.status === "online" ? "online" : "offline"
-        );
-      } catch {
-        if (active) setApiStatus("offline");
-      }
-    };
 
     const loadModelInfo = async () => {
       try {
@@ -130,7 +119,6 @@ function App() {
       }
     };
 
-    loadHealth();
     loadModelInfo();
 
     return () => {
@@ -144,9 +132,11 @@ function App() {
 
     setLoading(true);
     setResult(null);
+    setRobustness(null);
+    setRobustnessError(null);
 
     try {
-      const response = await fetch(`${API_BASE}/predict`, {
+      const response = await fetch(`${API_BASE}/analyze`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -184,10 +174,16 @@ function App() {
         explanation: Array.isArray(data.explanation)
           ? data.explanation.filter(isValidExplanationItem)
           : [],
+        attack_type: data.attack_type && typeof data.attack_type === "object"
+          ? data.attack_type
+          : null,
+        recommendation:
+          data.recommendation && typeof data.recommendation === "object"
+            ? data.recommendation
+            : null,
       };
 
       setResult(normalizedResult);
-      setApiStatus("online");
 
       setHistory((previousHistory) =>
         [
@@ -196,6 +192,7 @@ function App() {
             prediction: normalizedResult.prediction,
             malicious_probability: normalizedResult.malicious_probability,
             safe_probability: normalizedResult.safe_probability,
+            attack_label: normalizedResult.attack_type?.label || null,
             timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
           },
           ...previousHistory,
@@ -204,7 +201,6 @@ function App() {
     } catch (error) {
       console.error("Prompt analysis error:", error);
       const isNetworkError = error instanceof TypeError;
-      if (isNetworkError) setApiStatus("offline");
       setResult({
         error: isNetworkError
           ? "Unable to connect to the detection server. Check that the backend is running."
@@ -215,10 +211,61 @@ function App() {
     }
   };
 
+  // Run the separate robustness test for the current prompt.
+  const runRobustness = async () => {
+    const text = (result?.prompt || prompt).trim();
+    if (!text || robustnessLoading) return;
+
+    setRobustnessLoading(true);
+    setRobustnessError(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/robustness`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: text, include_paraphrase: true }),
+      });
+
+      let data = null;
+      try {
+        data = await response.json();
+      } catch {
+        data = null;
+      }
+
+      if (!response.ok) {
+        const detail = data && (data.detail || data.error);
+        throw new Error(
+          typeof detail === "string" && detail.length > 0
+            ? detail
+            : "The robustness test failed."
+        );
+      }
+
+      if (!data || !data.summary) {
+        throw new Error("The server returned an unexpected response.");
+      }
+
+      setRobustness(data);
+    } catch (error) {
+      console.error("Robustness test error:", error);
+      const isNetworkError = error instanceof TypeError;
+      setRobustnessError(
+        isNetworkError
+          ? "Unable to reach the detection server for robustness testing."
+          : error.message || "The robustness test could not be completed."
+      );
+    } finally {
+      setRobustnessLoading(false);
+    }
+  };
+
   // Clear the input and current result
   const clearAll = () => {
     setPrompt("");
     setResult(null);
+    setRobustness(null);
+    setRobustnessError(null);
   };
 
   const copyToClipboard = (text) => {
@@ -268,20 +315,6 @@ function App() {
         </div>
 
         <div className="header-right-clean">
-          <div
-            className={`header-chip-badge api-status-chip api-${apiStatus}`}
-            role="status"
-            aria-live="polite"
-          >
-            <span className="api-status-dot" />
-            <span>
-              {apiStatus === "online"
-                ? "API ONLINE"
-                : apiStatus === "checking"
-                ? "CHECKING API"
-                : "API OFFLINE"}
-            </span>
-          </div>
           <div className="header-chip-badge">
             <Sparkles size={13} className="chip-sparkle" />
             <span>EXPLAINABLE ML</span>
@@ -640,7 +673,17 @@ function App() {
           </section>
         )}
 
-        {/* 4. Model Performance Dashboard (Placed Downwards As Requested) */}
+        {/* 4. AI Security Intelligence (architecture + attack type + robustness + action) */}
+        <SecurityIntelligence
+          result={result}
+          modelInfo={modelInfo}
+          robustness={robustness}
+          robustnessLoading={robustnessLoading}
+          robustnessError={robustnessError}
+          onRunRobustness={runRobustness}
+        />
+
+        {/* 5. Model Performance Dashboard (Placed Downwards As Requested) */}
         <section className="dashboard-section">
           <TiltCard className="dashboard-card-3d" maxTilt={3} glowColor="rgba(37, 99, 235, 0.08)">
             <div className="section-head-3d">
